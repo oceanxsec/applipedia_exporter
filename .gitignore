@@ -1,4 +1,6 @@
 cookie.txt
 .idea/
 output/
+venv/
+__pycache__/
 application_list.html
