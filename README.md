@@ -4,6 +4,8 @@ Exports information from the Palo Alto Applipedia database.
 ## How to Use
 Obtain a cookie from https://applipedia.paloaltonetworks.com/ and save it to cookie.txt.
 
+Install requirements from requirements.txt.
+
 Then, simply run "exporter.py"
 
 You can view options with the "-h" or "--help" flags.
