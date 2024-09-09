@@ -9,6 +9,8 @@ from sys import exit
 import aiohttp
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from aiohttp import ClientSession
+from asyncio import Semaphore
 
 # paths/urls/constants
 application_list_path = Path.cwd() / 'application_list.html'
@@ -25,8 +27,18 @@ ssl_context = ssl.create_default_context()
 ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
 
+# Rate limiting and retry settings
+MAX_CONCURRENT_REQUESTS = 50
+RATE_LIMIT = 50  # requests per second
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
+PORTS_RETRY_DELAY = 2  # seconds
+
+rate_limiter = Semaphore(MAX_CONCURRENT_REQUESTS)
+
 
 async def main():
+    print("WARNING: Running at a very high rate (100 requests/second). This may cause issues with the server.")
     # obtain input
     parser = argparse.ArgumentParser(description='Exports information from the Palo Alto Applipedia database')
     parser.add_argument('-r', '--reload', action='store_true', help='reload application list (application_list.html)')
@@ -115,17 +127,21 @@ async def query_and_output(soup):
         w.writeheader()
         print('Exporting info for all applications...')
 
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-            tasks = [get_detailed_info(session, applications[application]) for application in applications]
+        async with ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
+            tasks = [get_detailed_info_with_retry(session, applications[application]) for application in applications]
             results = []
             for f in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-                results.append(await f)
+                result = await f
+                if result:
+                    results.append(result)
 
         for application, detailed_info in zip(applications, results):
-            detail_soup = BeautifulSoup(detailed_info, 'html.parser')
-            row_to_write = parse_detail_soup(detail_soup)  # returns a dictionary
-            row_to_write.update({'Application': application})
-            w.writerow(row_to_write)
+            if detailed_info:
+                detail_soup = BeautifulSoup(detailed_info, 'html.parser')
+                row_to_write = parse_detail_soup(detail_soup)
+                if row_to_write:  # Only write if we have data
+                    row_to_write.update({'Application': application})
+                    w.writerow(row_to_write)
 
         print('Done.')
 
@@ -151,7 +167,32 @@ def parse_detail_soup(detail_soup):
 
         n = n.find_next()
 
-    return row_to_write
+    return row_to_write if row_to_write else None  # Return None if no data was parsed
+
+
+async def get_detailed_info_with_retry(session, application_info):
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with rate_limiter:
+                result = await get_detailed_info(session, application_info)
+                if result:
+                    detail_soup = BeautifulSoup(result, 'html.parser')
+                    parsed_data = parse_detail_soup(detail_soup)
+                    if parsed_data and parsed_data.get('Standard Ports', '').strip():
+                        return result
+                    else:
+                        print(f"Empty Standard Ports for {application_info['appName']}. Retrying...")
+                        await asyncio.sleep(PORTS_RETRY_DELAY)
+                        continue
+        except aiohttp.ClientError as e:
+            print(f"Error fetching data for {application_info['appName']}: {e}")
+            if attempt < MAX_RETRIES - 1:
+                print(f"Retrying in {RETRY_DELAY} seconds...")
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                print(f"Max retries reached for {application_info['appName']}")
+        await asyncio.sleep(1 / RATE_LIMIT)  # Rate limiting
+    return None
 
 
 async def get_detailed_info(session, application_info):
@@ -181,9 +222,13 @@ async def get_detailed_info(session, application_info):
     url = 'https://applipedia.paloaltonetworks.com/Home/GetApplicationDetailView'
 
     async with session.post(url=url, headers=headers, data=application_info) as response:
-        application_detail = await response.text()
-
-    return application_detail
+        if response.status == 200:
+            application_detail = await response.text()
+            if application_detail:  # Check if the response is not empty
+                return application_detail
+        else:
+            print(f"Received status code {response.status} for {application_info['appName']}")
+    return None
 
 
 if __name__ == '__main__':
